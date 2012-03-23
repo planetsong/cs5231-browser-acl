@@ -25,7 +25,7 @@
 
 namespace JSC {
     class JSObject;
-    class MarkStack;
+    class SlotVisitor;
 }
 
 namespace WebCore {
@@ -53,23 +53,29 @@ namespace WebCore {
         virtual bool wasCreatedFromMarkup() const { return false; }
 
 #if USE(JSC)
-        virtual void markJSFunction(JSC::MarkStack&) { }
-        virtual void invalidateJSFunction(JSC::JSObject*) { }
+        virtual void visitJSFunction(JSC::SlotVisitor&) { }
 #endif
 
         bool isAttribute() const { return virtualisAttribute(); }
         Type type() const { return m_type; }
+		//ACL: Setter and getter for ringID element
+		void setRingID(int wid) { ringID = wid; }
+		int getRingID() { return ringID; }
+
 
     protected:
         EventListener(Type type)
             : m_type(type)
         {
+			ringID=0;
         }
 
     private:
         virtual bool virtualisAttribute() const { return false; }
         
         Type m_type;
+		//ACL: Created ringID element
+		int ringID;
     };
 
 }
