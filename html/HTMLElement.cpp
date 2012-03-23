@@ -3,6 +3,7 @@
  *           (C) 1999 Antti Koivisto (koivisto@kde.org)
  * Copyright (C) 2004, 2005, 2006, 2007, 2008 Apple Inc. All rights reserved.
  * Copyright (C) 2009 Torch Mobile Inc. All rights reserved. (http://www.torchmobile.com/)
+ * Copyright (C) 2011 Motorola Mobility. All rights reserved.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -25,8 +26,11 @@
 #include "HTMLElement.h"
 
 #include "Attribute.h"
+#include "CSSParser.h"
 #include "CSSPropertyNames.h"
 #include "CSSValueKeywords.h"
+#include "CSSValuePool.h"
+#include "ChildListMutationScope.h"
 #include "DocumentFragment.h"
 #include "Event.h"
 #include "EventListener.h"
@@ -40,18 +44,27 @@
 #include "HTMLFormElement.h"
 #include "HTMLNames.h"
 #include "HTMLParserIdioms.h"
+#include "HTMLTextFormControlElement.h"
 #include "RenderWordBreak.h"
 #include "ScriptEventListener.h"
 #include "Settings.h"
 #include "Text.h"
 #include "TextIterator.h"
+#include "XMLNames.h"
 #include "markup.h"
 #include <wtf/StdLibExtras.h>
 #include <wtf/text/CString.h>
+#include "V8IsolatedContext.h"
+
+
+#if ENABLE(MICRODATA)
+#include "MicroDataItemValue.h"
+#endif
 
 namespace WebCore {
 
 using namespace HTMLNames;
+using namespace WTF;
 
 using std::min;
 using std::max;
@@ -85,10 +98,6 @@ bool HTMLElement::ieForbidsInsertHTML() const
         || hasLocalName(basefontTag)
         || hasLocalName(brTag)
         || hasLocalName(colTag)
-#if ENABLE(DATAGRID)
-        || hasLocalName(dcellTag)
-        || hasLocalName(dcolTag)
-#endif
         || hasLocalName(embedTag)
         || hasLocalName(frameTag)
         || hasLocalName(hrTag)
@@ -114,147 +123,349 @@ bool HTMLElement::ieForbidsInsertHTML() const
     return false;
 }
 
-bool HTMLElement::mapToEntry(const QualifiedName& attrName, MappedAttributeEntry& result) const
+static inline int unicodeBidiAttributeForDirAuto(HTMLElement* element)
 {
-    if (attrName == alignAttr
-        || attrName == contenteditableAttr
-        || attrName == hiddenAttr) {
-        result = eUniversal;
-        return false;
-    }
-    if (attrName == dirAttr) {
-        result = hasLocalName(bdoTag) ? eBDO : eUniversal;
-        return false;
-    }
-
-    return StyledElement::mapToEntry(attrName, result);
+    if (element->hasLocalName(preTag) || element->hasLocalName(textareaTag))
+        return CSSValueWebkitPlaintext;
+    // FIXME: For bdo element, dir="auto" should result in "bidi-override isolate" but we don't support having multiple values in unicode-bidi yet.
+    // See https://bugs.webkit.org/show_bug.cgi?id=73164.
+    return CSSValueWebkitIsolate;
 }
-    
-void HTMLElement::parseMappedAttribute(Attribute* attr)
-{
-    if (isIdAttributeName(attr->name()) || attr->name() == classAttr || attr->name() == styleAttr)
-        return StyledElement::parseMappedAttribute(attr);
 
-    String indexstring;
+static unsigned parseBorderWidthAttribute(Attribute* attr)
+{
+    ASSERT(attr && attr->name() == borderAttr);
+
+    unsigned borderWidth = 0;
+    if (!attr->value().isEmpty())
+        parseHTMLNonNegativeInteger(attr->value(), borderWidth);
+
+    return borderWidth;
+}
+
+void HTMLElement::applyBorderAttributeToStyle(Attribute* attr, StylePropertySet* style)
+{
+    addPropertyToAttributeStyle(style, CSSPropertyBorderWidth, parseBorderWidthAttribute(attr), CSSPrimitiveValue::CSS_PX);
+    addPropertyToAttributeStyle(style, CSSPropertyBorderStyle, CSSValueSolid);
+}
+
+void HTMLElement::mapLanguageAttributeToLocale(Attribute* attribute, StylePropertySet* style)
+{
+    ASSERT(attribute && (attribute->name() == langAttr || attribute->name().matches(XMLNames::langAttr)));
+    if (!attribute->isEmpty()) {
+        // Have to quote so the locale id is treated as a string instead of as a CSS keyword.
+        addPropertyToAttributeStyle(style, CSSPropertyWebkitLocale, quoteCSSString(attribute->value()));
+    } else {
+        // The empty string means the language is explicitly unknown.
+        addPropertyToAttributeStyle(style, CSSPropertyWebkitLocale, CSSValueAuto);
+    }
+}
+
+bool HTMLElement::isPresentationAttribute(Attribute* attr) const
+{
+    if (attr->name() == alignAttr || attr->name() == contenteditableAttr || attr->name() == hiddenAttr || attr->name() == langAttr || attr->name().matches(XMLNames::langAttr) || attr->name() == draggableAttr || attr->name() == dirAttr)
+        return true;
+    return StyledElement::isPresentationAttribute(attr);
+}
+
+void HTMLElement::collectStyleForAttribute(Attribute* attr, StylePropertySet* style)
+{
     if (attr->name() == alignAttr) {
         if (equalIgnoringCase(attr->value(), "middle"))
-            addCSSProperty(attr, CSSPropertyTextAlign, "center");
+            addPropertyToAttributeStyle(style, CSSPropertyTextAlign, CSSValueCenter);
         else
-            addCSSProperty(attr, CSSPropertyTextAlign, attr->value());
+            addPropertyToAttributeStyle(style, CSSPropertyTextAlign, attr->value());
     } else if (attr->name() == contenteditableAttr) {
-        setContentEditable(attr);
+        if (attr->isEmpty() || equalIgnoringCase(attr->value(), "true")) {
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitUserModify, CSSValueReadWrite);
+            addPropertyToAttributeStyle(style, CSSPropertyWordWrap, CSSValueBreakWord);
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitNbspMode, CSSValueSpace);
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitLineBreak, CSSValueAfterWhiteSpace);
+        } else if (equalIgnoringCase(attr->value(), "plaintext-only")) {
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitUserModify, CSSValueReadWritePlaintextOnly);
+            addPropertyToAttributeStyle(style, CSSPropertyWordWrap, CSSValueBreakWord);
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitNbspMode, CSSValueSpace);
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitLineBreak, CSSValueAfterWhiteSpace);
+        } else if (equalIgnoringCase(attr->value(), "false"))
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitUserModify, CSSValueReadOnly);
     } else if (attr->name() == hiddenAttr) {
-        addCSSProperty(attr, CSSPropertyDisplay, CSSValueNone);
-    } else if (attr->name() == tabindexAttr) {
-        indexstring = getAttribute(tabindexAttr);
+        addPropertyToAttributeStyle(style, CSSPropertyDisplay, CSSValueNone);
+    } else if (attr->name() == draggableAttr) {
+        if (equalIgnoringCase(attr->value(), "true")) {
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitUserDrag, CSSValueElement);
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitUserSelect, CSSValueNone);
+        } else if (equalIgnoringCase(attr->value(), "false"))
+            addPropertyToAttributeStyle(style, CSSPropertyWebkitUserDrag, CSSValueNone);
+    } else if (attr->name() == dirAttr) {
+        if (equalIgnoringCase(attr->value(), "auto"))
+            addPropertyToAttributeStyle(style, CSSPropertyUnicodeBidi, unicodeBidiAttributeForDirAuto(this));
+        else {
+            addPropertyToAttributeStyle(style, CSSPropertyDirection, attr->value());
+            if (!hasTagName(bdiTag) && !hasTagName(bdoTag) && !hasTagName(outputTag))
+                addPropertyToAttributeStyle(style, CSSPropertyUnicodeBidi, CSSValueEmbed);
+        }
+    } else if (attr->name().matches(XMLNames::langAttr)) {
+        mapLanguageAttributeToLocale(attr, style);
+    } else if (attr->name() == langAttr) {
+        // xml:lang has a higher priority than lang.
+        if (!fastHasAttribute(XMLNames::langAttr))
+            mapLanguageAttributeToLocale(attr, style);
+    } else
+        StyledElement::collectStyleForAttribute(attr, style);
+}
+
+void HTMLElement::parseAttribute(Attribute* attr)
+{
+    if (isIdAttributeName(attr->name()) || attr->name() == classAttr || attr->name() == styleAttr)
+        return StyledElement::parseAttribute(attr);
+
+    if (attr->name() == dirAttr)
+        dirAttributeChanged(attr);
+    else if (attr->name() == tabindexAttr) {
         int tabindex = 0;
-        if (parseHTMLInteger(indexstring, tabindex)) {
+        if (attr->isEmpty())
+            clearTabIndexExplicitly();
+        else if (parseHTMLInteger(attr->value(), tabindex)) {
             // Clamp tabindex to the range of 'short' to match Firefox's behavior.
             setTabIndexExplicitly(max(static_cast<int>(std::numeric_limits<short>::min()), min(tabindex, static_cast<int>(std::numeric_limits<short>::max()))));
         }
-    } else if (attr->name() == langAttr) {
-        // FIXME: Implement
-    } else if (attr->name() == dirAttr) {
-        addCSSProperty(attr, CSSPropertyDirection, attr->value());
-        addCSSProperty(attr, CSSPropertyUnicodeBidi, hasLocalName(bdoTag) ? CSSValueBidiOverride : CSSValueEmbed);
-    } else if (attr->name() == draggableAttr) {
-        const AtomicString& value = attr->value();
-        if (equalIgnoringCase(value, "true")) {
-            addCSSProperty(attr, CSSPropertyWebkitUserDrag, CSSValueElement);
-            addCSSProperty(attr, CSSPropertyWebkitUserSelect, CSSValueNone);
-        } else if (equalIgnoringCase(value, "false"))
-            addCSSProperty(attr, CSSPropertyWebkitUserDrag, CSSValueNone);
+#if ENABLE(MICRODATA)
+    } else if (attr->name() == itempropAttr) {
+        setItemProp(attr->value());
+    } else if (attr->name() == itemrefAttr) {
+        setItemRef(attr->value());
+    } else if (attr->name() == itemtypeAttr) {
+        setItemType(attr->value());
+        itemTypeAttributeChanged();
+#endif
     }
 // standard events
     else if (attr->name() == onclickAttr) {
+		//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().clickEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == oncontextmenuAttr) {
+		//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().contextmenuEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ondblclickAttr) {
+		//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().dblclickEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onmousedownAttr) {
+		//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().mousedownEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onmousemoveAttr) {
+		//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().mousemoveEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onmouseoutAttr) {
+		//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().mouseoutEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onmouseoverAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().mouseoverEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onmouseupAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().mouseupEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onmousewheelAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().mousewheelEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onfocusAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().focusEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onfocusinAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().focusinEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onfocusoutAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().focusoutEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onblurAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().blurEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onkeydownAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().keydownEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onkeypressAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().keypressEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onkeyupAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().keyupEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onscrollAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().scrollEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onbeforecutAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().beforecutEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == oncutAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().cutEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onbeforecopyAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().beforecopyEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == oncopyAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().copyEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onbeforepasteAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().beforepasteEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onpasteAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().pasteEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ondragenterAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().dragenterEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ondragoverAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().dragoverEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ondragleaveAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().dragleaveEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ondropAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().dropEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ondragstartAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().dragstartEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ondragAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().dragEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ondragendAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().dragendEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onselectstartAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().selectstartEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onsubmitAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().submitEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onerrorAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().errorEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onwebkitanimationstartAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().webkitAnimationStartEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onwebkitanimationiterationAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().webkitAnimationIterationEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onwebkitanimationendAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().webkitAnimationEndEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == onwebkittransitionendAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().webkitTransitionEndEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == oninputAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().inputEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == oninvalidAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().invalidEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ontouchstartAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().touchstartEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ontouchmoveAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().touchmoveEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ontouchendAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().touchendEvent, createAttributeEventListener(this, attr));
     } else if (attr->name() == ontouchcancelAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().touchcancelEvent, createAttributeEventListener(this, attr));
 #if ENABLE(FULLSCREEN_API)
     } else if (attr->name() == onwebkitfullscreenchangeAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
         setAttributeEventListener(eventNames().webkitfullscreenchangeEvent, createAttributeEventListener(this, attr));
+    } else if (attr->name() == onwebkitfullscreenerrorAttr) {
+				//ACL: EvenListener::setRingID
+		RefPtr<V8LazyEventListener> eventlistener = createAttributeEventListener(this, attr);
+		if (attr->getRingID()!=0) eventlistener->setRingID(attr->getRingID());
+        setAttributeEventListener(eventNames().webkitfullscreenerrorEvent, createAttributeEventListener(this, attr));
 #endif
     }
 }
@@ -267,20 +478,6 @@ String HTMLElement::innerHTML() const
 String HTMLElement::outerHTML() const
 {
     return createMarkup(this);
-}
-
-// FIXME: This logic should move into Range::createContextualFragment
-PassRefPtr<DocumentFragment> HTMLElement::deprecatedCreateContextualFragment(const String& markup, FragmentScriptingPermission scriptingPermission)
-{
-    // The following is in accordance with the definition as used by IE.
-    if (ieForbidsInsertHTML())
-        return 0;
-
-    if (hasLocalName(colTag) || hasLocalName(colgroupTag) || hasLocalName(framesetTag)
-        || hasLocalName(headTag) || hasLocalName(styleTag) || hasLocalName(titleTag))
-        return 0;
-
-    return Element::deprecatedCreateContextualFragment(markup, scriptingPermission);
 }
 
 static inline bool hasOneChild(ContainerNode* node)
@@ -296,13 +493,17 @@ static inline bool hasOneTextChild(ContainerNode* node)
 
 static void replaceChildrenWithFragment(HTMLElement* element, PassRefPtr<DocumentFragment> fragment, ExceptionCode& ec)
 {
+#if ENABLE(MUTATION_OBSERVERS)
+    ChildListMutationScope mutation(element);
+#endif
+
     if (!fragment->firstChild()) {
         element->removeChildren();
         return;
     }
 
     if (hasOneTextChild(element) && hasOneTextChild(fragment.get())) {
-        static_cast<Text*>(element->firstChild())->setData(static_cast<Text*>(fragment->firstChild())->data(), ec);
+        toText(element->firstChild())->setData(toText(fragment->firstChild())->data(), ec);
         return;
     }
 
@@ -317,8 +518,12 @@ static void replaceChildrenWithFragment(HTMLElement* element, PassRefPtr<Documen
 
 static void replaceChildrenWithText(HTMLElement* element, const String& text, ExceptionCode& ec)
 {
+#if ENABLE(MUTATION_OBSERVERS)
+    ChildListMutationScope mutation(element);
+#endif
+
     if (hasOneTextChild(element)) {
-        static_cast<Text*>(element->firstChild())->setData(text, ec);
+        toText(element->firstChild())->setData(text, ec);
         return;
     }
 
@@ -355,9 +560,37 @@ static PassRefPtr<DocumentFragment> createFragmentFromSource(const String& marku
 
 void HTMLElement::setInnerHTML(const String& html, ExceptionCode& ec)
 {
+
+	//ACL: 
+	int ringID = 0;
+	V8IsolatedContext* isolatedContext = V8IsolatedContext::getEntered();
+	if (isolatedContext!=0)	ringID = isolatedContext->getRingID();
+	if (ringID == 0)
+	{
+		this->remoremoveAttribute("ACL", ec);
+		this->removeAttribute("ROACL", ec);
+	}
+	//end ACL--
+
     RefPtr<DocumentFragment> fragment = createFragmentFromSource(html, this, ec);
     if (fragment)
         replaceChildrenWithFragment(this, fragment.release(), ec);
+}
+
+static void mergeWithNextTextNode(PassRefPtr<Node> node, ExceptionCode& ec)
+{
+    ASSERT(node && node->isTextNode());
+    Node* next = node->nextSibling();
+    if (!next || !next->isTextNode())
+        return;
+    
+    RefPtr<Text> textNode = toText(node.get());
+    RefPtr<Text> textNext = toText(next);
+    textNode->appendData(textNext->data(), ec);
+    if (ec)
+        return;
+    if (textNext->parentNode()) // Might have been removed by mutation event.
+        textNext->remove(ec);
 }
 
 void HTMLElement::setOuterHTML(const String& html, ExceptionCode& ec)
@@ -367,13 +600,54 @@ void HTMLElement::setOuterHTML(const String& html, ExceptionCode& ec)
         ec = NO_MODIFICATION_ALLOWED_ERR;
         return;
     }
-    HTMLElement* parent = static_cast<HTMLElement*>(p);
+    RefPtr<HTMLElement> parent = toHTMLElement(p);
+    RefPtr<Node> prev = previousSibling();
+    RefPtr<Node> next = nextSibling();
 
-    RefPtr<DocumentFragment> fragment = createFragmentFromSource(html, parent, ec);
-    if (fragment) {
-        // FIXME: Why doesn't this have code to merge neighboring text nodes the way setOuterText does?
-        parent->replaceChild(fragment.release(), this, ec);
+    RefPtr<DocumentFragment> fragment = createFragmentFromSource(html, parent.get(), ec);
+    if (ec)
+        return;
+      
+    parent->replaceChild(fragment.release(), this, ec);
+    RefPtr<Node> node = next ? next->previousSibling() : 0;
+    if (!ec && node && node->isTextNode())
+        mergeWithNextTextNode(node.release(), ec);
+
+    if (!ec && prev && prev->isTextNode())
+        mergeWithNextTextNode(prev.release(), ec);
+}
+
+PassRefPtr<DocumentFragment> HTMLElement::textToFragment(const String& text, ExceptionCode& ec)
+{
+    RefPtr<DocumentFragment> fragment = DocumentFragment::create(document());
+    unsigned int i, length = text.length();
+    UChar c = 0;
+    for (unsigned int start = 0; start < length; ) {
+
+        // Find next line break.
+        for (i = start; i < length; i++) {
+          c = text[i];
+          if (c == '\r' || c == '\n')
+              break;
+        }
+
+        fragment->appendChild(Text::create(document(), text.substring(start, i - start)), ec);
+        if (ec)
+            return 0;
+
+        if (c == '\r' || c == '\n') {
+            fragment->appendChild(HTMLBRElement::create(document()), ec);
+            if (ec)
+                return 0;
+            // Make sure \r\n doesn't result in two line breaks.
+            if (c == '\r' && i + 1 < length && text[i + 1] == '\n')
+                i++;
+        }
+
+        start = i + 1; // Character after line break.
     }
+
+    return fragment;
 }
 
 void HTMLElement::setInnerText(const String& text, ExceptionCode& ec)
@@ -389,6 +663,17 @@ void HTMLElement::setInnerText(const String& text, ExceptionCode& ec)
         ec = NO_MODIFICATION_ALLOWED_ERR;
         return;
     }
+
+	//ACL: 
+	int ringID = 0;
+	V8IsolatedContext* isolatedContext = V8IsolatedContext::getEntered();
+	if (isolatedContext!=0)	ringID = isolatedContext->getRingID();
+	if (ringID == 0)
+	{
+		this->remoremoveAttribute("ACL", ec);
+		this->removeAttribute("ROACL", ec);
+	}
+	//end ACL--
 
     // FIXME: This doesn't take whitespace collapsing into account at all.
 
@@ -419,30 +704,9 @@ void HTMLElement::setInnerText(const String& text, ExceptionCode& ec)
 
     // Add text nodes and <br> elements.
     ec = 0;
-    RefPtr<DocumentFragment> fragment = DocumentFragment::create(document());
-    int lineStart = 0;
-    UChar prev = 0;
-    int length = text.length();
-    for (int i = 0; i < length; ++i) {
-        UChar c = text[i];
-        if (c == '\n' || c == '\r') {
-            if (i > lineStart) {
-                fragment->appendChild(Text::create(document(), text.substring(lineStart, i - lineStart)), ec);
-                if (ec)
-                    return;
-            }
-            if (!(c == '\n' && i != 0 && prev == '\r')) {
-                fragment->appendChild(HTMLBRElement::create(document()), ec);
-                if (ec)
-                    return;
-            }
-            lineStart = i + 1;
-        }
-        prev = c;
-    }
-    if (length > lineStart)
-        fragment->appendChild(Text::create(document(), text.substring(lineStart, length - lineStart)), ec);
-    replaceChildrenWithFragment(this, fragment.release(), ec);
+    RefPtr<DocumentFragment> fragment = textToFragment(text, ec);
+    if (!ec)
+        replaceChildrenWithFragment(this, fragment.release(), ec);
 }
 
 void HTMLElement::setOuterText(const String &text, ExceptionCode& ec)
@@ -465,39 +729,29 @@ void HTMLElement::setOuterText(const String &text, ExceptionCode& ec)
         return;
     }
 
-    // FIXME: This creates a new text node even when the text is empty.
-    // FIXME: This creates a single text node even when the text has CR and LF
-    // characters in it. Instead it should create <br> elements.
-    RefPtr<Text> t = Text::create(document(), text);
+    RefPtr<Node> prev = previousSibling();
+    RefPtr<Node> next = nextSibling();
+    RefPtr<Node> newChild;
     ec = 0;
-    parent->replaceChild(t, this, ec);
+    
+    // Convert text to fragment with <br> tags instead of linebreaks if needed.
+    if (text.contains('\r') || text.contains('\n'))
+        newChild = textToFragment(text, ec);
+    else
+        newChild = Text::create(document(), text);
+
+    if (!this || !parentNode())
+        ec = HIERARCHY_REQUEST_ERR;
     if (ec)
         return;
+    parent->replaceChild(newChild.release(), this, ec);
 
-    // Is previous node a text node? If so, merge into it.
-    Node* prev = t->previousSibling();
-    if (prev && prev->isTextNode()) {
-        Text* textPrev = static_cast<Text*>(prev);
-        textPrev->appendData(t->data(), ec);
-        if (ec)
-            return;
-        t->remove(ec);
-        if (ec)
-            return;
-        t = textPrev;
-    }
+    RefPtr<Node> node = next ? next->previousSibling() : 0;
+    if (!ec && node && node->isTextNode())
+        mergeWithNextTextNode(node.release(), ec);
 
-    // Is next node a text node? If so, merge it in.
-    Node* next = t->nextSibling();
-    if (next && next->isTextNode()) {
-        Text* textNext = static_cast<Text*>(next);
-        t->appendData(textNext->data(), ec);
-        if (ec)
-            return;
-        textNext->remove(ec);
-        if (ec)
-            return;
-    }
+    if (!ec && prev && prev->isTextNode())
+        mergeWithNextTextNode(prev.release(), ec);
 }
 
 Node* HTMLElement::insertAdjacent(const String& where, Node* newChild, ExceptionCode& ec)
@@ -548,7 +802,7 @@ static Element* contextElementForInsertion(const String& where, Element* element
 {
     if (equalIgnoringCase(where, "beforeBegin") || equalIgnoringCase(where, "afterEnd")) {
         ContainerNode* parent = element->parentNode();
-        if (parent && parent->isDocumentNode()) {
+        if (parent && !parent->isElementNode()) {
             ec = NO_MODIFICATION_ALLOWED_ERR;
             return 0;
         }
@@ -585,12 +839,7 @@ void HTMLElement::insertAdjacentText(const String& where, const String& text, Ex
     insertAdjacent(where, textNode.get(), ec);
 }
 
-void HTMLElement::addHTMLAlignment(Attribute* attr)
-{
-    addHTMLAlignmentToStyledElement(this, attr);
-}
-
-void HTMLElement::addHTMLAlignmentToStyledElement(StyledElement* element, Attribute* attr)
+void HTMLElement::applyAlignmentAttributeToStyle(Attribute* attr, StylePropertySet* style)
 {
     // Vertical alignment with respect to the current baseline of the text
     // right or left means floating images.
@@ -620,102 +869,45 @@ void HTMLElement::addHTMLAlignmentToStyledElement(StyledElement* element, Attrib
         verticalAlignValue = CSSValueTextTop;
 
     if (floatValue != CSSValueInvalid)
-        element->addCSSProperty(attr, CSSPropertyFloat, floatValue);
+        addPropertyToAttributeStyle(style, CSSPropertyFloat, floatValue);
 
     if (verticalAlignValue != CSSValueInvalid)
-        element->addCSSProperty(attr, CSSPropertyVerticalAlign, verticalAlignValue);
+        addPropertyToAttributeStyle(style, CSSPropertyVerticalAlign, verticalAlignValue);
 }
 
 bool HTMLElement::supportsFocus() const
 {
-    return Element::supportsFocus() || (isContentEditable() && parentNode() && !parentNode()->isContentEditable());
+    return Element::supportsFocus() || (rendererIsEditable() && parentNode() && !parentNode()->rendererIsEditable());
 }
 
-bool HTMLElement::isContentEditable() const 
+String HTMLElement::contentEditable() const
 {
-    if (document()->frame() && document()->frame()->isContentEditable())
-        return true;
+    const AtomicString& value = fastGetAttribute(contenteditableAttr);
 
-    // Ideally we'd call ASSERT!needsStyleRecalc()) here, but
-    // ContainerNode::setFocus() calls setNeedsStyleRecalc(), so the assertion
-    // would fire in the middle of Document::setFocusedNode().
+    if (value.isNull())
+        return "inherit";
+    if (value.isEmpty() || equalIgnoringCase(value, "true"))
+        return "true";
+    if (equalIgnoringCase(value, "false"))
+         return "false";
+    if (equalIgnoringCase(value, "plaintext-only"))
+        return "plaintext-only";
 
-    if (!renderer()) {
-        if (parentNode())
-            return parentNode()->isContentEditable();
-        else
-            return false;
-    }
-    
-    return renderer()->style()->userModify() == READ_WRITE || renderer()->style()->userModify() == READ_WRITE_PLAINTEXT_ONLY;
+    return "inherit";
 }
 
-bool HTMLElement::isContentRichlyEditable() const
+void HTMLElement::setContentEditable(const String& enabled, ExceptionCode& ec)
 {
-    if (document()->frame() && document()->frame()->isContentEditable())
-        return true;
-
-    if (!renderer()) {
-        if (parentNode())
-            return parentNode()->isContentEditable();
-        else
-            return false;
-    }
-    
-    return renderer()->style()->userModify() == READ_WRITE;
-}
-
-String HTMLElement::contentEditable() const 
-{
-    if (!renderer())
-        return "false";
-    
-    switch (renderer()->style()->userModify()) {
-        case READ_WRITE:
-            return "true";
-        case READ_ONLY:
-            return "false";
-        case READ_WRITE_PLAINTEXT_ONLY:
-            return "plaintext-only";
-        default:
-            return "inherit";
-    }
-}
-
-void HTMLElement::setContentEditable(Attribute* attr) 
-{
-    const AtomicString& enabled = attr->value();
-    if (enabled.isEmpty() || equalIgnoringCase(enabled, "true")) {
-        addCSSProperty(attr, CSSPropertyWebkitUserModify, CSSValueReadWrite);
-        addCSSProperty(attr, CSSPropertyWordWrap, CSSValueBreakWord);
-        addCSSProperty(attr, CSSPropertyWebkitNbspMode, CSSValueSpace);
-        addCSSProperty(attr, CSSPropertyWebkitLineBreak, CSSValueAfterWhiteSpace);
-    } else if (equalIgnoringCase(enabled, "false")) {
-        addCSSProperty(attr, CSSPropertyWebkitUserModify, CSSValueReadOnly);
-        attr->decl()->removeProperty(CSSPropertyWordWrap, false);
-        attr->decl()->removeProperty(CSSPropertyWebkitNbspMode, false);
-        attr->decl()->removeProperty(CSSPropertyWebkitLineBreak, false);
-    } else if (equalIgnoringCase(enabled, "inherit")) {
-        addCSSProperty(attr, CSSPropertyWebkitUserModify, CSSValueInherit);
-        attr->decl()->removeProperty(CSSPropertyWordWrap, false);
-        attr->decl()->removeProperty(CSSPropertyWebkitNbspMode, false);
-        attr->decl()->removeProperty(CSSPropertyWebkitLineBreak, false);
-    } else if (equalIgnoringCase(enabled, "plaintext-only")) {
-        addCSSProperty(attr, CSSPropertyWebkitUserModify, CSSValueReadWritePlaintextOnly);
-        addCSSProperty(attr, CSSPropertyWordWrap, CSSValueBreakWord);
-        addCSSProperty(attr, CSSPropertyWebkitNbspMode, CSSValueSpace);
-        addCSSProperty(attr, CSSPropertyWebkitLineBreak, CSSValueAfterWhiteSpace);
-    }
-}
-
-void HTMLElement::setContentEditable(const String &enabled)
-{
-    if (enabled == "inherit") {
-        ExceptionCode ec;
-        removeAttribute(contenteditableAttr, ec);
-    }
+    if (equalIgnoringCase(enabled, "true"))
+        setAttribute(contenteditableAttr, "true");
+    else if (equalIgnoringCase(enabled, "false"))
+        setAttribute(contenteditableAttr, "false");
+    else if (equalIgnoringCase(enabled, "plaintext-only"))
+        setAttribute(contenteditableAttr, "plaintext-only");
+    else if (equalIgnoringCase(enabled, "inherit"))
+        removeAttribute(contenteditableAttr);
     else
-        setAttribute(contenteditableAttr, enabled.isEmpty() ? "true" : enabled);
+        ec = SYNTAX_ERR;
 }
 
 bool HTMLElement::draggable() const
@@ -744,17 +936,9 @@ void HTMLElement::click()
     dispatchSimulatedClick(0, false, false);
 }
 
-// accessKeyAction is used by the accessibility support code
-// to send events to elements that our JavaScript caller does
-// does not.  The elements JS is interested in have subclasses
-// that override this method to direct the click appropriately.
-// Here in the base class, then, we only send the click if
-// the caller wants it to go to any HTMLElement, and we say
-// to send the mouse events in addition to the click.
-void HTMLElement::accessKeyAction(bool sendToAnyElement)
+void HTMLElement::accessKeyAction(bool sendMouseEvents)
 {
-    if (sendToAnyElement)
-        dispatchSimulatedClick(0, true);
+    dispatchSimulatedClick(0, sendMouseEvents);
 }
 
 String HTMLElement::title() const
@@ -774,28 +958,59 @@ void HTMLElement::setTabIndex(int value)
     setAttribute(tabindexAttr, String::number(value));
 }
 
-PassRefPtr<HTMLCollection> HTMLElement::children()
+TranslateAttributeMode HTMLElement::translateAttributeMode() const
 {
-    return HTMLCollection::create(this, NodeChildren);
+    const AtomicString& value = getAttribute(translateAttr);
+
+    if (value == nullAtom)
+        return TranslateAttributeInherit;
+    if (equalIgnoringCase(value, "yes") || equalIgnoringCase(value, ""))
+        return TranslateAttributeYes;
+    if (equalIgnoringCase(value, "no"))
+        return TranslateAttributeNo;
+
+    return TranslateAttributeInherit;
 }
 
-bool HTMLElement::rendererIsNeeded(RenderStyle *style)
+bool HTMLElement::translate() const
+{
+    for (const Node* n = this; n; n = n->parentNode()) {
+        if (n->isHTMLElement()) {
+            TranslateAttributeMode mode = static_cast<const HTMLElement*>(n)->translateAttributeMode();
+            if (mode != TranslateAttributeInherit) {
+                ASSERT(mode == TranslateAttributeYes || mode == TranslateAttributeNo);
+                return mode == TranslateAttributeYes;
+            }
+        }
+    }
+
+    // Default on the root element is translate=yes.
+    return true;
+}
+
+void HTMLElement::setTranslate(bool enable)
+{
+    setAttribute(translateAttr, enable ? "yes" : "no");
+}
+
+
+HTMLCollection* HTMLElement::children()
+{
+    return ensureCachedHTMLCollection(NodeChildren);
+}
+
+bool HTMLElement::rendererIsNeeded(const NodeRenderingContext& context)
 {
     if (hasLocalName(noscriptTag)) {
         Frame* frame = document()->frame();
-#if ENABLE(XHTMLMP)
-        if (!document()->shouldProcessNoscriptElement())
-            return false;
-#else
         if (frame && frame->script()->canExecuteScripts(NotAboutToExecuteScript))
             return false;
-#endif        
     } else if (hasLocalName(noembedTag)) {
         Frame* frame = document()->frame();
         if (frame && frame->loader()->subframeLoader()->allowPlugins(NotAboutToInstantiatePlugin))
             return false;
     }
-    return StyledElement::rendererIsNeeded(style);
+    return StyledElement::rendererIsNeeded(context);
 }
 
 RenderObject* HTMLElement::createRenderer(RenderArena* arena, RenderStyle* style)
@@ -818,6 +1033,330 @@ HTMLFormElement* HTMLElement::virtualForm() const
 {
     return findFormAncestor();
 }
+
+static void setHasDirAutoFlagRecursively(Node* firstNode, bool flag, Node* lastNode = 0)
+{
+    firstNode->setSelfOrAncestorHasDirAutoAttribute(flag);
+
+    Node* node = firstNode->firstChild();
+
+    while (node) {
+        if (node->selfOrAncestorHasDirAutoAttribute() == flag)
+            return;
+
+        if (node->isHTMLElement() && toElement(node)->hasAttribute(dirAttr)) {
+            if (node == lastNode)
+                return;
+            node = node->traverseNextSibling(firstNode);
+            continue;
+        }
+        node->setSelfOrAncestorHasDirAutoAttribute(flag);
+        if (node == lastNode)
+            return;
+        node = node->traverseNextNode(firstNode);
+    }
+}
+
+void HTMLElement::childrenChanged(bool changedByParser, Node* beforeChange, Node* afterChange, int childCountDelta)
+{
+    StyledElement::childrenChanged(changedByParser, beforeChange, afterChange, childCountDelta);
+    adjustDirectionalityIfNeededAfterChildrenChanged(beforeChange, childCountDelta);
+}
+
+TextDirection HTMLElement::directionalityIfhasDirAutoAttribute(bool& isAuto) const
+{
+    if (!(selfOrAncestorHasDirAutoAttribute() && equalIgnoringCase(getAttribute(dirAttr), "auto"))) {
+        isAuto = false;
+        return LTR;
+    }
+
+    isAuto = true;
+    return directionality();
+}
+
+TextDirection HTMLElement::directionality(Node** strongDirectionalityTextNode) const
+{
+    if (HTMLTextFormControlElement* textElement = toTextFormControl(const_cast<HTMLElement*>(this))) {
+        bool hasStrongDirectionality;
+        Unicode::Direction textDirection = textElement->value().defaultWritingDirection(&hasStrongDirectionality);
+        if (strongDirectionalityTextNode)
+            *strongDirectionalityTextNode = hasStrongDirectionality ? textElement : 0;
+        return (textDirection == Unicode::LeftToRight) ? LTR : RTL;
+    }
+
+    Node* node = firstChild();
+    while (node) {
+        // Skip bdi, script, style and text form controls.
+        if (equalIgnoringCase(node->nodeName(), "bdi") || node->hasTagName(scriptTag) || node->hasTagName(styleTag) 
+            || (node->isElementNode() && toElement(node)->isTextFormControl())) {
+            node = node->traverseNextSibling(this);
+            continue;
+        }
+
+        // Skip elements with valid dir attribute
+        if (node->isElementNode()) {
+            AtomicString dirAttributeValue = toElement(node)->fastGetAttribute(dirAttr);
+            if (equalIgnoringCase(dirAttributeValue, "rtl") || equalIgnoringCase(dirAttributeValue, "ltr") || equalIgnoringCase(dirAttributeValue, "auto")) {
+                node = node->traverseNextSibling(this);
+                continue;
+            }
+        }
+
+        if (node->isTextNode()) {
+            bool hasStrongDirectionality;
+            WTF::Unicode::Direction textDirection = node->textContent(true).defaultWritingDirection(&hasStrongDirectionality);
+            if (hasStrongDirectionality) {
+                if (strongDirectionalityTextNode)
+                    *strongDirectionalityTextNode = node;
+                return (textDirection == WTF::Unicode::LeftToRight) ? LTR : RTL;
+            }
+        }
+        node = node->traverseNextNode(this);
+    }
+    if (strongDirectionalityTextNode)
+        *strongDirectionalityTextNode = 0;
+    return LTR;
+}
+
+void HTMLElement::dirAttributeChanged(Attribute* attribute)
+{
+    Element* parent = parentElement();
+
+    if (parent && parent->isHTMLElement() && parent->selfOrAncestorHasDirAutoAttribute())
+        toHTMLElement(parent)->adjustDirectionalityIfNeededAfterChildAttributeChanged(this);
+
+    if (equalIgnoringCase(attribute->value(), "auto"))
+        calculateAndAdjustDirectionality();
+}
+
+void HTMLElement::adjustDirectionalityIfNeededAfterChildAttributeChanged(Element* child)
+{
+    ASSERT(selfOrAncestorHasDirAutoAttribute());
+    Node* strongDirectionalityTextNode;
+    TextDirection textDirection = directionality(&strongDirectionalityTextNode);
+    setHasDirAutoFlagRecursively(child, false);
+    if (renderer() && renderer()->style() && renderer()->style()->direction() != textDirection) {
+        Element* elementToAdjust = this;
+        for (; elementToAdjust; elementToAdjust = elementToAdjust->parentElement()) {
+            if (elementToAdjust->hasAttribute(dirAttr)) {
+                elementToAdjust->setNeedsStyleRecalc();
+                return;
+            }
+        }
+    }
+}
+
+void HTMLElement::calculateAndAdjustDirectionality()
+{
+    Node* strongDirectionalityTextNode;
+    TextDirection textDirection = directionality(&strongDirectionalityTextNode);
+    setHasDirAutoFlagRecursively(this, true, strongDirectionalityTextNode);
+    if (renderer() && renderer()->style() && renderer()->style()->direction() != textDirection)
+        setNeedsStyleRecalc();
+}
+
+void HTMLElement::adjustDirectionalityIfNeededAfterChildrenChanged(Node* beforeChange, int childCountDelta)
+{
+    if ((!document() || document()->renderer()) && childCountDelta < 0) {
+        Node* node = beforeChange ? beforeChange->traverseNextSibling() : 0;
+        for (int counter = 0; node && counter < childCountDelta; counter++, node = node->traverseNextSibling()) {
+            if (node->isElementNode() && toElement(node)->hasAttribute(dirAttr))
+                continue;
+
+            setHasDirAutoFlagRecursively(node, false);
+        }
+    }
+
+    if (!selfOrAncestorHasDirAutoAttribute())
+        return;
+
+    Node* oldMarkedNode = beforeChange ? beforeChange->traverseNextSibling() : 0;
+    while (oldMarkedNode && oldMarkedNode->isHTMLElement() && toHTMLElement(oldMarkedNode)->hasAttribute(dirAttr))
+        oldMarkedNode = oldMarkedNode->traverseNextSibling(this);
+    if (oldMarkedNode)
+        setHasDirAutoFlagRecursively(oldMarkedNode, false);
+
+    for (Element* elementToAdjust = this; elementToAdjust; elementToAdjust = elementToAdjust->parentElement()) {
+        if (elementToAdjust->isHTMLElement() && elementToAdjust->hasAttribute(dirAttr)) {
+            toHTMLElement(elementToAdjust)->calculateAndAdjustDirectionality();
+            return;
+        }
+    }
+}
+
+bool HTMLElement::isURLAttribute(Attribute* attribute) const
+{
+#if ENABLE(MICRODATA)
+    return attribute->name() == itemidAttr;
+#else
+    UNUSED_PARAM(attribute);
+    return false;
+#endif
+}
+
+#if ENABLE(MICRODATA)
+void HTMLElement::setItemValue(const String& value, ExceptionCode& ec)
+{
+    if (!hasAttribute(itempropAttr) || hasAttribute(itemscopeAttr)) {
+        ec = INVALID_ACCESS_ERR;
+        return;
+    }
+
+    setItemValueText(value, ec);
+}
+
+PassRefPtr<MicroDataItemValue> HTMLElement::itemValue() const
+{
+    if (!hasAttribute(itempropAttr))
+        return 0;
+
+    if (hasAttribute(itemscopeAttr))
+        return MicroDataItemValue::createFromNode(const_cast<HTMLElement* const>(this));
+
+    return MicroDataItemValue::createFromString(itemValueText());
+}
+
+String HTMLElement::itemValueText() const
+{
+    return textContent(true);
+}
+
+void HTMLElement::setItemValueText(const String& value, ExceptionCode& ec)
+{
+    setTextContent(value, ec);
+}
+#endif
+
+void HTMLElement::addHTMLLengthToStyle(StylePropertySet* style, int propertyID, const String& value)
+{
+    // FIXME: This function should not spin up the CSS parser, but should instead just figure out the correct
+    // length unit and make the appropriate parsed value.
+
+    // strip attribute garbage..
+    StringImpl* v = value.impl();
+    if (v) {
+        unsigned int l = 0;
+
+        while (l < v->length() && (*v)[l] <= ' ')
+            l++;
+
+        for (; l < v->length(); l++) {
+            UChar cc = (*v)[l];
+            if (cc > '9')
+                break;
+            if (cc < '0') {
+                if (cc == '%' || cc == '*')
+                    l++;
+                if (cc != '.')
+                    break;
+            }
+        }
+
+        if (l != v->length()) {
+            addPropertyToAttributeStyle(style, propertyID, v->substring(0, l));
+            return;
+        }
+    }
+
+    addPropertyToAttributeStyle(style, propertyID, value);
+}
+
+static RGBA32 parseColorStringWithCrazyLegacyRules(const String& colorString)
+{
+    // Per spec, only look at the first 128 digits of the string.
+    const size_t maxColorLength = 128;
+    // We'll pad the buffer with two extra 0s later, so reserve two more than the max.
+    Vector<char, maxColorLength+2> digitBuffer;
+
+    size_t i = 0;
+    // Skip a leading #.
+    if (colorString[0] == '#')
+        i = 1;
+
+    // Grab the first 128 characters, replacing non-hex characters with 0.
+    // Non-BMP characters are replaced with "00" due to them appearing as two "characters" in the String.
+    for (; i < colorString.length() && digitBuffer.size() < maxColorLength; i++) {
+        if (!isASCIIHexDigit(colorString[i]))
+            digitBuffer.append('0');
+        else
+            digitBuffer.append(colorString[i]);
+    }
+
+    if (!digitBuffer.size())
+        return Color::black;
+
+    // Pad the buffer out to at least the next multiple of three in size.
+    digitBuffer.append('0');
+    digitBuffer.append('0');
+
+    if (digitBuffer.size() < 6)
+        return makeRGB(toASCIIHexValue(digitBuffer[0]), toASCIIHexValue(digitBuffer[1]), toASCIIHexValue(digitBuffer[2]));
+
+    // Split the digits into three components, then search the last 8 digits of each component.
+    ASSERT(digitBuffer.size() >= 6);
+    size_t componentLength = digitBuffer.size() / 3;
+    size_t componentSearchWindowLength = min<size_t>(componentLength, 8);
+    size_t redIndex = componentLength - componentSearchWindowLength;
+    size_t greenIndex = componentLength * 2 - componentSearchWindowLength;
+    size_t blueIndex = componentLength * 3 - componentSearchWindowLength;
+    // Skip digits until one of them is non-zero, or we've only got two digits left in the component.
+    while (digitBuffer[redIndex] == '0' && digitBuffer[greenIndex] == '0' && digitBuffer[blueIndex] == '0' && (componentLength - redIndex) > 2) {
+        redIndex++;
+        greenIndex++;
+        blueIndex++;
+    }
+    ASSERT(redIndex + 1 < componentLength);
+    ASSERT(greenIndex >= componentLength);
+    ASSERT(greenIndex + 1 < componentLength * 2);
+    ASSERT(blueIndex >= componentLength * 2);
+    ASSERT(blueIndex + 1 < digitBuffer.size());
+
+    int redValue = toASCIIHexValue(digitBuffer[redIndex], digitBuffer[redIndex + 1]);
+    int greenValue = toASCIIHexValue(digitBuffer[greenIndex], digitBuffer[greenIndex + 1]);
+    int blueValue = toASCIIHexValue(digitBuffer[blueIndex], digitBuffer[blueIndex + 1]);
+    return makeRGB(redValue, greenValue, blueValue);
+}
+
+// Color parsing that matches HTML's "rules for parsing a legacy color value"
+void HTMLElement::addHTMLColorToStyle(StylePropertySet* style, int propertyID, const String& attributeValue)
+{
+    // An empty string doesn't apply a color. (One containing only whitespace does, which is why this check occurs before stripping.)
+    if (attributeValue.isEmpty())
+        return;
+
+    String colorString = attributeValue.stripWhiteSpace();
+
+    // "transparent" doesn't apply a color either.
+    if (equalIgnoringCase(colorString, "transparent"))
+        return;
+
+    // If the string is a named CSS color or a 3/6-digit hex color, use that.
+    Color parsedColor(colorString);
+    if (!parsedColor.isValid())
+        parsedColor.setRGB(parseColorStringWithCrazyLegacyRules(colorString));
+
+    style->setProperty(propertyID, document()->cssValuePool()->createColorValue(parsedColor.rgb()));
+}
+
+void StyledElement::copyNonAttributeProperties(const Element* sourceElement)
+{
+    ASSERT(sourceElement);
+    ASSERT(sourceElement->isStyledElement());
+
+    const StyledElement* source = static_cast<const StyledElement*>(sourceElement);
+    if (!source->inlineStyleDecl())
+        return;
+
+    StylePropertySet* inlineStyle = ensureInlineStyleDecl();
+    inlineStyle->copyPropertiesFrom(*source->inlineStyleDecl());
+    inlineStyle->setStrictParsing(source->inlineStyleDecl()->useStrictParsing());
+
+    setIsStyleAttributeValid(source->isStyleAttributeValid());
+    setIsSynchronizingStyleAttribute(source->isSynchronizingStyleAttribute());
+    
+    Element::copyNonAttributeProperties(sourceElement);
+}
+
 
 } // namespace WebCore
 
