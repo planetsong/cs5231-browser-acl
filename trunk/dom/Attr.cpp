@@ -26,8 +26,11 @@
 #include "Element.h"
 #include "ExceptionCode.h"
 #include "HTMLNames.h"
+#include "ScopedEventQueue.h"
 #include "Text.h"
 #include "XMLNSNames.h"
+#include <wtf/text/AtomicString.h>
+#include <wtf/text/StringBuilder.h>
 
 namespace WebCore {
 
@@ -119,22 +122,29 @@ String Attr::nodeValue() const
 
 void Attr::setValue(const AtomicString& value)
 {
+	//ACL: Do not process setValue for ACL items
+	if ((this->name() == "xacl")||(this->name() == "wacl")||(this->name() =="racl")||(this->name() == "ringid")) return;
+    EventQueueScope scope;
     m_ignoreChildrenChanged++;
     removeChildren();
     m_attribute->setValue(value);
     createTextChild();
     m_ignoreChildrenChanged--;
+
+    invalidateNodeListsCacheAfterAttributeChanged(m_attribute->name());
 }
 
 void Attr::setValue(const AtomicString& value, ExceptionCode&)
 {
-    if (m_element && m_element->isIdAttributeName(m_attribute->name()))
-        m_element->updateId(m_element->getIdAttribute(), value);
+	//ACL: Do not process setValue for ACL items
+	if ((this->name() == "xacl")||(this->name() == "wacl")||(this->name() =="racl")||(this->name() == "ringid")) return;
+    if (m_element)
+        m_element->willModifyAttribute(m_attribute->name(), m_attribute->value(), value);
 
     setValue(value);
 
     if (m_element)
-        m_element->attributeChanged(m_attribute.get());
+        m_element->didModifyAttribute(m_attribute.get());
 }
 
 void Attr::setNodeValue(const String& v, ExceptionCode& ec)
@@ -150,7 +160,7 @@ PassRefPtr<Node> Attr::cloneNode(bool /*deep*/)
 }
 
 // DOM Section 1.1.1
-bool Attr::childTypeAllowed(NodeType type)
+bool Attr::childTypeAllowed(NodeType type) const
 {
     switch (type) {
         case TEXT_NODE:
@@ -165,21 +175,24 @@ void Attr::childrenChanged(bool changedByParser, Node* beforeChange, Node* after
 {
     if (m_ignoreChildrenChanged > 0)
         return;
- 
+
     Node::childrenChanged(changedByParser, beforeChange, afterChange, childCountDelta);
 
+    invalidateNodeListsCacheAfterAttributeChanged(m_attribute->name());
+
     // FIXME: We should include entity references in the value
-    
-    String val = "";
+
+    StringBuilder valueBuilder;
     for (Node *n = firstChild(); n; n = n->nextSibling()) {
         if (n->isTextNode())
-            val += static_cast<Text *>(n)->data();
+            valueBuilder.append(toText(n)->data());
     }
 
-    if (m_element && m_element->isIdAttributeName(m_attribute->name()))
-        m_element->updateId(m_attribute->value(), val);
+    AtomicString newValue = valueBuilder.toString();
+    if (m_element)
+        m_element->willModifyAttribute(m_attribute->name(), m_attribute->value(), newValue);
 
-    m_attribute->setValue(val.impl());
+    m_attribute->setValue(newValue);
     if (m_element)
         m_element->attributeChanged(m_attribute.get());
 }
